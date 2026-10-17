@@ -1,38 +1,71 @@
 # Guestbook
 
-A simple PHP guestbook API using SQLite, served by Nginx and exposed through Cloudflare Tunnel.
+A lightweight PHP and SQLite guestbook API served by Nginx and exposed through Cloudflare Tunnel.
 
 ## Features
 
-- Retrieve guestbook messages via `GET /api.php`
-- Submit messages via `POST /api.php`
-- SQLite storage
-- Input validation and length limits
-- Prepared SQL statements
-- Honeypot field for basic bot detection
-- Reject messages containing more than one HTTP/HTTPS link
-- Limit message listings to the 100 most recent entries
-- JSON error responses
-- Restrict cross-origin browser access to the configured website
+- `GET /api.php`: retrieve the 100 most recent messages.
+- `POST /api.php`: submit a message.
+- Input validation, prepared SQL statements, and basic spam protection.
+
+## Requirements
+
+Debian, Nginx, PHP-FPM 8.4 with SQLite and `mbstring`, and optionally Cloudflare Tunnel.
+
+## Deployment
+
+### 1. Install dependencies
+
+```bash
+sudo apt update
+sudo apt install nginx php8.4-fpm php8.4-sqlite3 php8.4-mbstring
+```
+
+### 2. Install the API
+
+```bash
+sudo install -d -o root -g root -m 755 /var/www/guestbook
+sudo install -o root -g root -m 644 api.php /var/www/guestbook/api.php
+```
+
+### 3. Set up the database directory
+
+PHP-FPM runs as `www-data` by default on Debian. The directory must be writable so SQLite can create the database and auxiliary files.
+
+```bash
+sudo install -d -o www-data -g www-data -m 750 /var/lib/guestbook
+```
+
+The API creates the database and table automatically.
+
+### 4. Configure Nginx
+
+Install and enable the configuration:
+
+```bash
+sudo install -o root -g root -m 644 guestbook.conf /etc/nginx/sites-available/guestbook
+sudo ln -s /etc/nginx/sites-available/guestbook /etc/nginx/sites-enabled/guestbook
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+The configuration must use the correct hostname and PHP-FPM socket (`/run/php/php8.4-fpm.sock`).
+
+### 5. Configure Cloudflare Tunnel (optional)
+
+Route `guestbook.maricakes.de` to `http://127.0.0.1:80`. Ensure the Nginx `server_name` matches the hostname.
+
+### 6. Test
+
+```bash
+php -l /var/www/guestbook/api.php
+curl -i -H 'Host: guestbook.maricakes.de' http://127.0.0.1/api.php
+```
+
+Configure Cloudflare rate limiting for `POST /api.php` to reduce automated submissions.
 
 ## API
 
-### Retrieve messages
-
-```http
-GET /api.php
-```
-
-Returns up to 100 messages, newest first.
-
-### Submit a message
-
-```http
-POST /api.php
-Content-Type: application/json
-```
-
-Example request:
+Submit a message using `POST /api.php` with `Content-Type: application/json`:
 
 ```json
 {
@@ -42,39 +75,5 @@ Example request:
 }
 ```
 
-Successful response:
+Names are limited to 50 characters and messages to 500 characters. The API rejects empty fields and messages containing more than one HTTP/HTTPS link.
 
-```json
-{
-  "ok": true
-}
-```
-
-The name is limited to 50 characters and the message to 500 characters. Empty fields, invalid JSON, and messages containing more than one HTTP/HTTPS link are rejected.
-
-## Requirements
-
-- Linux server
-- Nginx
-- PHP-FPM with PDO SQLite and `mbstring`
-- SQLite
-- Cloudflare Tunnel (optional)
-
-## Deployment
-
-1. Place `api.php` in the web root.
-2. Configure Nginx to pass `/api.php` to PHP-FPM.
-3. Ensure the PHP-FPM user has appropriate access to `/var/lib/guestbook/guestbook.db` and its directory.
-4. Configure Cloudflare Tunnel to route the guestbook hostname to the local Nginx service.
-5. Configure rate limiting at Cloudflare to reduce automated submission abuse.
-
-Keep the SQLite database, tunnel credentials, and private server configuration out of the repository.
-
-## Security notes
-
-- The API uses prepared statements for database writes.
-- The API's CORS policy restricts browser access to the configured frontend origin. CORS is not authentication and does not prevent direct HTTP requests.
-- The honeypot and link limit provide basic spam deterrence, not comprehensive bot protection.
-- Configure rate limiting separately; application-level validation alone does not prevent request flooding.
-- The frontend must safely render user-submitted content, for example using JavaScript `textContent` rather than `innerHTML`.
-- Configure PHP to log errors privately rather than expose internal details to visitors.
