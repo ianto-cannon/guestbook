@@ -1,6 +1,6 @@
 # Guestbook
 
-A lightweight PHP and SQLite guestbook API served by Nginx and exposed through Cloudflare Tunnel.
+A lightweight PHP and SQLite guestbook API served by Nginx and exposed through Cloudflare Tunnel. See it live at https://ianto-cannon.github.io/guestbook.html
 
 ## Features
 
