@@ -42,7 +42,7 @@ try {
     if ($method === "GET") {
         $stmt = $db->query(
             "SELECT name, message, ts
-             FROM messages ORDER BY id DESC LIMIT 100"
+             FROM messages ORDER BY id DESC LIMIT 1000"
         );
         echo json_encode(
             $stmt->fetchAll(PDO::FETCH_ASSOC),

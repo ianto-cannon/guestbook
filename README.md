@@ -4,7 +4,7 @@ A lightweight PHP and SQLite guestbook API served by Nginx and exposed through C
 
 ## Features
 
-- `GET /api.php`: retrieve the 100 most recent messages.
+- `GET /api.php`: retrieve the 1000 most recent messages.
 - `POST /api.php`: submit a message.
 - Input validation, prepared SQL statements, and basic spam protection.
 
