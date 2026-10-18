@@ -52,13 +52,13 @@ The configuration must use the correct hostname and PHP-FPM socket (`/run/php/ph
 
 ### 5. Configure Cloudflare Tunnel (optional)
 
-Route `guestbook.maricakes.de` to `http://127.0.0.1:80`. Ensure the Nginx `server_name` matches the hostname.
+Route `guestbook.yoururl.com` to `http://127.0.0.1:80`. Ensure the Nginx `server_name` matches the hostname.
 
 ### 6. Test
 
 ```bash
 php -l /var/www/guestbook/api.php
-curl -i -H 'Host: guestbook.maricakes.de' http://127.0.0.1/api.php
+curl -i -H 'Host: guestbook.yoururl.com' http://127.0.0.1/api.php
 ```
 
 Configure Cloudflare rate limiting for `POST /api.php` to reduce automated submissions.

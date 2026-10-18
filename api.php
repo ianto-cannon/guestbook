@@ -2,7 +2,7 @@
 declare(strict_types=1);
 
 header("Content-Type: application/json; charset=utf-8");
-header("Access-Control-Allow-Origin: https://ianto-cannon.github.io");
+header("Access-Control-Allow-Origin: https://your-username.github.io");
 header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type");
 header("Cache-Control: no-store");
