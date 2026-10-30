@@ -1,0 +1,24 @@
+[Unit]
+Description=Guestbook API (Rust)
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+ExecStart=/usr/local/bin/guestbook-api
+Environment=GUESTBOOK_DB=/var/lib/guestbook/guestbook.db
+Environment=GUESTBOOK_ADDR=127.0.0.1:8080
+# Uncomment if your php.ini timezone was not UTC and you want to keep local timestamps:
+# Environment=GUESTBOOK_LOCALTIME=1
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/guestbook
+
+[Install]
+WantedBy=multi-user.target
