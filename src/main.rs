@@ -1,60 +1,40 @@
-//! Drop-in Rust replacement for /var/www/guestbook/api.php
+//! Guestbook API as a CGI program, storing one text file per message.
 //!
-//! Same table (`messages`), same JSON shapes, same status codes, same limits.
-//! The handler is path-agnostic: nginx decides which URL reaches it.
+//! File name:    YYYY-MM-DD_HH-MM-SS_Name.txt   (UTC; spaces in Name stored as '_')
+//! File content: the message text
+//!
+//! Run per request by fcgiwrap. Request comes in via CGI environment
+//! variables (REQUEST_METHOD, CONTENT_TYPE, CONTENT_LENGTH) and stdin; the
+//! response goes to stdout. JSON shapes, status codes and limits follow the
+//! PHP version, plus a stricter name rule and a 409 on collisions.
 
 use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
+    env,
+    fs::{self, OpenOptions},
+    io::{self, Read, Write},
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use axum::{
-    body::{to_bytes, Body},
-    extract::{Request, State},
-    http::{header, Method, StatusCode},
-    response::Response,
-    Router,
-};
-use rusqlite::{types::Type, Connection};
 use serde_json::{json, Value};
 
-const ALLOWED_ORIGIN: &str = "https://ianto-cannon.github.io";
 const MAX_BODY: usize = 8192;
 const MAX_JSON_DEPTH: usize = 16;
 const MAX_NAME_CHARS: usize = 50;
 const MAX_MESSAGE_CHARS: usize = 500;
+const SHOWN: usize = 100;
+const DEFAULT_DIR: &str = "/var/lib/guestbook/messages";
 
-#[derive(Clone)]
-struct AppState {
-    db: Arc<Mutex<Connection>>,
-    insert_sql: Arc<String>,
+/// (status line, extra header lines each ending in \r\n, body)
+type Reply = (&'static str, &'static str, String);
+
+fn fail(status: &'static str, msg: &str) -> Reply {
+    (status, "", json!({ "error": msg }).to_string())
 }
 
-// ---------- response helpers (CORS + no-store on every response) ----------
-
-fn builder(status: StatusCode) -> axum::http::response::Builder {
-    axum::http::Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, ALLOWED_ORIGIN)
-        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
-        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type")
-        .header(header::CACHE_CONTROL, "no-store")
-}
-
-fn reply(status: StatusCode, value: Value) -> Response {
-    builder(status)
-        .body(Body::from(value.to_string()))
-        .expect("valid response")
-}
-
-fn fail(status: StatusCode, msg: &str) -> Response {
-    reply(status, json!({ "error": msg }))
-}
-
-fn server_error(e: impl std::fmt::Display) -> Response {
-    eprintln!("Guestbook API database or server error: {e}");
-    fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+fn server_error(e: impl std::fmt::Display) -> Reply {
+    eprintln!("Guestbook API storage or server error: {e}");
+    fail("500 Internal Server Error", "Internal server error")
 }
 
 // ---------- small PHP-compat helpers ----------
@@ -96,95 +76,156 @@ fn exceeds_depth(raw: &[u8], max: usize) -> bool {
 /// Equivalent of preg_match_all('~https?://~i', ...).
 fn count_links(s: &str) -> usize {
     let l = s.to_ascii_lowercase();
-    l.match_indices("http")
-        .filter(|(i, _)| {
-            let rest = &l[i + 4..];
-            rest.starts_with("://") || rest.starts_with("s://")
-        })
-        .count()
+    l.matches("http://").count() + l.matches("https://").count()
 }
 
-/// Read a TEXT column, substituting invalid UTF-8 (like JSON_INVALID_UTF8_SUBSTITUTE).
-fn text(r: &rusqlite::Row, i: usize) -> rusqlite::Result<String> {
-    let bytes = r
-        .get_ref(i)?
-        .as_bytes()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(i, Type::Text, Box::new(e)))?;
-    Ok(String::from_utf8_lossy(bytes).into_owned())
+// ---------- names and file names ----------
+
+/// Letters (any language), digits, space, hyphen and period; at least one
+/// letter or digit. Everything else is rejected, so a name can never contain
+/// a path separator, control character or leading-dot trick, and '_' is free
+/// to stand for a space in file names.
+fn name_ok(n: &str) -> bool {
+    n.chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
+        && n.chars().any(char::is_alphanumeric)
+}
+
+/// "YYYY-MM-DD_HH-MM-SS" (UTC) for a Unix timestamp.
+fn stamp_from_secs(secs: u64) -> String {
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Days since 1970-01-01 -> civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!(
+        "{y:04}-{m:02}-{d:02}_{:02}-{:02}-{:02}",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
+}
+
+/// Split "YYYY-MM-DD_HH-MM-SS_Name.txt" into ("YYYY-MM-DD HH:MM:SS", "Name").
+/// Anything that doesn't match (temp files, stray files) gives None.
+fn parse_filename(f: &str) -> Option<(String, String)> {
+    let stem = f.strip_suffix(".txt")?;
+    let (stamp, rest) = (stem.get(..19)?, stem.get(19..)?);
+    let name = rest.strip_prefix('_')?;
+    let well_formed = stamp.bytes().enumerate().all(|(i, b)| match i {
+        4 | 7 | 13 | 16 => b == b'-',
+        10 => b == b'_',
+        _ => b.is_ascii_digit(),
+    });
+    if !well_formed || name.is_empty() {
+        return None;
+    }
+    let ts = format!("{} {}", &stamp[..10], stamp[11..].replace('-', ":"));
+    Some((ts, name.replace('_', " ")))
+}
+
+// ---------- storage ----------
+
+fn messages_dir() -> PathBuf {
+    // GUESTBOOK_DIR can be set with `fastcgi_param` (handy for testing).
+    PathBuf::from(env::var("GUESTBOOK_DIR").unwrap_or_else(|_| DEFAULT_DIR.into()))
+}
+
+fn newest_messages() -> io::Result<Vec<Value>> {
+    let dir = messages_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut found: Vec<(String, String, String)> = entries
+        .filter_map(|e| {
+            let file = e.ok()?.file_name().into_string().ok()?;
+            let (ts, name) = parse_filename(&file)?;
+            Some((file, ts, name))
+        })
+        .collect();
+    // The timestamp comes first and is fixed-width, so name order = time order.
+    found.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+    Ok(found
+        .into_iter()
+        .filter_map(|(file, ts, name)| {
+            // A file deleted between listing and reading is simply skipped.
+            let bytes = fs::read(dir.join(file)).ok()?;
+            let message = String::from_utf8_lossy(&bytes);
+            Some(json!({ "name": name, "message": message.trim_end(), "ts": ts }))
+        })
+        .take(SHOWN)
+        .collect())
+}
+
+/// Write the message to a temp file, then publish it under its final name
+/// with a hard link. Unlike rename, a hard link never replaces an existing
+/// file, so a collision fails with AlreadyExists and nothing is overwritten.
+/// Readers never see a half-written message, since only complete files get a
+/// final name, and temp files don't match parse_filename().
+fn store_message(name: &str, message: &str) -> io::Result<()> {
+    let dir = messages_dir();
+    fs::create_dir_all(&dir)?;
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let stamp = stamp_from_secs(now.as_secs());
+    let target = dir.join(format!("{stamp}_{}.txt", name.replace(' ', "_")));
+    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), now.subsec_nanos()));
+
+    let result = (|| {
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(message.as_bytes())?;
+        f.write_all(b"\n")?;
+        f.sync_all()?;
+        fs::hard_link(&tmp, &target)
+    })();
+    let _ = fs::remove_file(&tmp);
+    result
 }
 
 // ---------- handlers ----------
 
-async fn handle(State(state): State<AppState>, req: Request) -> Response {
-    let method = req.method().clone();
-
-    if method == Method::OPTIONS {
-        return builder(StatusCode::NO_CONTENT)
-            .body(Body::empty())
-            .expect("valid response");
-    }
-    if method == Method::GET {
-        return list(state).await;
-    }
-    if method == Method::POST {
-        return create(state, req).await;
-    }
-
-    let mut resp = fail(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed");
-    resp.headers_mut()
-        .insert(header::ALLOW, "GET, POST, OPTIONS".parse().unwrap());
-    resp
-}
-
-async fn list(state: AppState) -> Response {
-    let res = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<Value>> {
-        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stmt = db.prepare(
-            "SELECT name, message, ts FROM messages ORDER BY id DESC LIMIT 1000",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(json!({
-                "name": text(r, 0)?,
-                "message": text(r, 1)?,
-                "ts": text(r, 2)?,
-            }))
-        })?;
-        rows.collect()
-    })
-    .await;
-
-    match res {
-        Ok(Ok(rows)) => reply(StatusCode::OK, Value::Array(rows)),
-        Ok(Err(e)) => server_error(e),
+fn list() -> Reply {
+    match newest_messages() {
+        Ok(rows) => ("200 OK", "", Value::Array(rows).to_string()),
         Err(e) => server_error(e),
     }
 }
 
-async fn create(state: AppState, req: Request) -> Response {
-    let bad = StatusCode::BAD_REQUEST;
+fn create() -> Reply {
+    let bad = "400 Bad Request";
 
-    // Grab the content type before the body is consumed.
-    let content_type = req
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
+    // 1. Reject oversized request bodies.
+    let len: usize = env::var("CONTENT_LENGTH")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    if len > MAX_BODY {
+        return fail("413 Payload Too Large", "Request too large");
+    }
+    let mut raw = Vec::with_capacity(len);
+    if io::stdin().take(len as u64).read_to_end(&mut raw).is_err() {
+        return fail("413 Payload Too Large", "Request too large");
+    }
+
+    // 2. Require JSON.
+    let content_type = env::var("CONTENT_TYPE").unwrap_or_default();
+    let content_type = content_type
         .split(';')
         .next()
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-
-    // 1. Reject oversized request bodies.
-    let raw = match to_bytes(req.into_body(), MAX_BODY + 1).await {
-        Ok(b) if b.len() <= MAX_BODY => b,
-        _ => return fail(StatusCode::PAYLOAD_TOO_LARGE, "Request too large"),
-    };
-
-    // 2. Require JSON.
     if content_type != "application/json" {
         return fail(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "415 Unsupported Media Type",
             "Content-Type must be application/json",
         );
     }
@@ -219,71 +260,91 @@ async fn create(state: AppState, req: Request) -> Response {
     if name.chars().count() > MAX_NAME_CHARS || message.chars().count() > MAX_MESSAGE_CHARS {
         return fail(bad, "Name or message is too long");
     }
+    if !name_ok(name) {
+        return fail(
+            bad,
+            "Name may only contain letters, numbers, spaces, hyphens and periods",
+        );
+    }
 
     // Simple spam deterrent, not a security boundary.
     if count_links(message) > 1 {
         return fail(bad, "Too many links in message");
     }
 
-    // 6. Insert.
-    let (name, message) = (name.to_owned(), message.to_owned());
-    let res = tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
-        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-        db.execute(state.insert_sql.as_str(), rusqlite::params![name, message])?;
-        Ok(())
-    })
-    .await;
-
-    match res {
-        Ok(Ok(())) => reply(StatusCode::OK, json!({ "ok": true })),
-        Ok(Err(e)) => server_error(e),
+    // 6. Store. A same-name post within the same second is refused, never overwritten.
+    match store_message(name, message) {
+        Ok(()) => ("200 OK", "", json!({ "ok": true }).to_string()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => fail(
+            "409 Conflict",
+            "A message from this name was just posted, please try again in a moment",
+        ),
         Err(e) => server_error(e),
     }
 }
 
-// ---------- startup ----------
+fn handle() -> Reply {
+    match env::var("REQUEST_METHOD").unwrap_or_default().as_str() {
+        "OPTIONS" => ("204 No Content", "", String::new()),
+        "GET" => list(),
+        "POST" => create(),
+        _ => (
+            "405 Method Not Allowed",
+            "Allow: GET, POST, OPTIONS\r\n",
+            json!({ "error": "Method not allowed" }).to_string(),
+        ),
+    }
+}
 
-#[tokio::main]
-async fn main() {
-    let db_path = std::env::var("GUESTBOOK_DB")
-        .unwrap_or_else(|_| "/var/lib/guestbook/guestbook.db".into());
-    let conn = Connection::open(&db_path)
-        .unwrap_or_else(|e| panic!("failed to open database {db_path}: {e}"));
-    conn.busy_timeout(Duration::from_millis(3000))
-        .expect("failed to set busy_timeout");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            message TEXT NOT NULL,
-            ts TEXT NOT NULL
-        )",
-    )
-    .expect("failed to create schema");
-
-    // PHP's date() used the PHP timezone; SQLite defaults to UTC.
-    // Set GUESTBOOK_LOCALTIME=1 to use the system's local timezone instead.
-    let ts_args = if std::env::var("GUESTBOOK_LOCALTIME").as_deref() == Ok("1") {
-        "'now', 'localtime'"
-    } else {
-        "'now'"
-    };
-    let insert_sql = format!(
-        "INSERT INTO messages (name, message, ts) \
-         VALUES (?1, ?2, strftime('%Y-%m-%d %H:%M:%S', {ts_args}))"
+fn main() {
+    let (status, extra, body) = handle();
+    let out = format!(
+        "Status: {status}\r\n\
+         Content-Type: application/json; charset=utf-8\r\n\
+         Access-Control-Allow-Origin: https://ianto-cannon.github.io\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Content-Type\r\n\
+         Cache-Control: no-store\r\n\
+         {extra}\r\n{body}"
     );
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(out.as_bytes());
+    let _ = stdout.flush();
+}
 
-    let state = AppState {
-        db: Arc::new(Mutex::new(conn)),
-        insert_sql: Arc::new(insert_sql),
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let app = Router::new().fallback(handle).with_state(state);
+    #[test]
+    fn stamps_match_known_dates() {
+        assert_eq!(stamp_from_secs(0), "1970-01-01_00-00-00");
+        assert_eq!(stamp_from_secs(951_782_400), "2000-02-29_00-00-00");
+        assert_eq!(stamp_from_secs(1_000_000_000), "2001-09-09_01-46-40");
+        assert_eq!(stamp_from_secs(1_709_164_800), "2024-02-29_00-00-00");
+        assert_eq!(stamp_from_secs(4_102_444_799), "2099-12-31_23-59-59");
+    }
 
-    let addr = std::env::var("GUESTBOOK_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
-    println!("guestbook listening on http://{addr}");
-    axum::serve(listener, app).await.expect("server error");
+    #[test]
+    fn name_rules() {
+        for ok in ["Ianto", "Mary Ann", "Zoë Müller", "J. R.", "a-b", "Åsa 2"] {
+            assert!(name_ok(ok), "{ok}");
+        }
+        for bad in ["", "../x", "a/b", "a\\b", "a_b", "x\ny", "---", "...", "a:b", "<b>", "a\0b"] {
+            assert!(!name_ok(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn filename_round_trip() {
+        let f = format!("{}_{}.txt", stamp_from_secs(1_000_000_000), "Mary Ann".replace(' ', "_"));
+        assert_eq!(f, "2001-09-09_01-46-40_Mary_Ann.txt");
+        assert_eq!(
+            parse_filename(&f),
+            Some(("2001-09-09 01:46:40".into(), "Mary Ann".into()))
+        );
+        for junk in [".tmp-1-2", "notes.txt", "2001-09-09_01-46-40_.txt", "2001-09-09_01-46-40.txt", "x.txt"] {
+            assert_eq!(parse_filename(junk), None, "{junk}");
+        }
+    }
 }
